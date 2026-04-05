@@ -60,4 +60,8 @@ class InvoiceConsumer(AsyncWebsocketConsumer):
 
     # Called by Celery via channel_layer.group_send(type="invoice.update")
     async def invoice_update(self, event):
-        await self.send(text_data=json.dumps(event["data"]))
+        await self.send(text_data=json.dumps({"_type": "invoice", **event["data"]}))
+
+    # Called by _push_notification via channel_layer.group_send(type="notification.new")
+    async def notification_new(self, event):
+        await self.send(text_data=json.dumps({"_type": "notification", **event["data"]}))

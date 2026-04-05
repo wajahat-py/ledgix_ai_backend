@@ -14,3 +14,7 @@ sqlparse==0.5.5
 tzdata==2025.3
 openai>=1.82.0
 rapidfuzz>=3.0.0
+resend>=2.0.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.160.0

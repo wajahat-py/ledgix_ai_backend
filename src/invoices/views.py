@@ -5,9 +5,11 @@ from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import Invoice
-from .serializers import InvoiceSerializer
-from .tasks import process_invoice
+from .dashboard import compute_dashboard
+from .models import DuplicateCheckResult, Invoice, Notification
+from .serializers import InvoiceSerializer, NotificationSerializer
+from .tasks import check_invoice_duplicates, process_invoice
+from .utils import FREE_PLAN_LIMIT, monthly_invoice_count
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +30,12 @@ class InvoiceListView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        invoices = Invoice.objects.filter(user=request.user).order_by("-created_at")
+        invoices = (
+            Invoice.objects
+            .filter(user=request.user)
+            .select_related("duplicate_check", "duplicate_check__best_match")
+            .order_by("-created_at")
+        )
         return Response(InvoiceSerializer(invoices, many=True, context={"request": request}).data)
 
 
@@ -51,7 +58,11 @@ class InvoiceDetailView(APIView):
 
     def get(self, request, pk):
         try:
-            invoice = Invoice.objects.get(pk=pk, user=request.user)
+            invoice = (
+                Invoice.objects
+                .select_related("duplicate_check", "duplicate_check__best_match")
+                .get(pk=pk, user=request.user)
+            )
         except Invoice.DoesNotExist:
             return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
         return Response(InvoiceSerializer(invoice, context={"request": request}).data)
@@ -142,6 +153,138 @@ class InvoiceProcessView(APIView):
         return Response(InvoiceSerializer(invoice, context={"request": request}).data)
 
 
+class InvoiceRecheckDuplicatesView(APIView):
+    """POST /api/invoices/<pk>/recheck-duplicates/ — re-queue duplicate detection."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    _RECHECKABLE = frozenset({
+        Invoice.Status.PROCESSED,
+        Invoice.Status.PENDING_REVIEW,
+        Invoice.Status.APPROVED,
+        Invoice.Status.REJECTED,
+    })
+
+    def post(self, request, pk):
+        try:
+            invoice = Invoice.objects.get(pk=pk, user=request.user)
+        except Invoice.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        if invoice.status not in self._RECHECKABLE:
+            return Response(
+                {"detail": "Duplicate check requires a processed invoice."},
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            )
+
+        check_invoice_duplicates.delay(invoice.id)
+        logger.info("Re-queued duplicate check for invoice %s by user %s", invoice.id, request.user.id)
+        return Response(InvoiceSerializer(invoice, context={"request": request}).data)
+
+
+class InvoiceDismissDuplicateView(APIView):
+    """POST /api/invoices/<pk>/dismiss-duplicate/ — toggle the dismissed flag on a duplicate result."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            invoice = Invoice.objects.get(pk=pk, user=request.user)
+        except Invoice.DoesNotExist:
+            return Response({"detail": "Not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            dup_check = invoice.duplicate_check
+        except DuplicateCheckResult.DoesNotExist:
+            return Response(
+                {"detail": "No duplicate check result for this invoice."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        dismissed = bool(request.data.get("dismissed", True))
+        dup_check.dismissed = dismissed
+        dup_check.save(update_fields=["dismissed"])
+
+        invoice_fresh = (
+            Invoice.objects
+            .select_related("duplicate_check", "duplicate_check__best_match")
+            .get(pk=pk)
+        )
+        return Response(InvoiceSerializer(invoice_fresh, context={"request": request}).data)
+
+
+class DashboardView(APIView):
+    """GET /api/invoices/dashboard/?range=30d — aggregated dashboard data."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        range_str = request.query_params.get("range", "30d")
+        if range_str not in ("7d", "30d", "90d"):
+            range_str = "30d"
+        data = compute_dashboard(request.user, range_str)
+        return Response(data)
+
+
+class BulkReprocessFailedView(APIView):
+    """POST /api/invoices/reprocess-failed/ — re-queue all PROCESSING_FAILED invoices."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        failed_invoices = Invoice.objects.filter(
+            user=request.user,
+            status=Invoice.Status.PROCESSING_FAILED,
+        )
+        count = failed_invoices.count()
+        if count == 0:
+            return Response({"detail": "No failed invoices to reprocess.", "queued": 0})
+
+        for invoice in failed_invoices:
+            process_invoice.delay(invoice.id)
+            logger.info("Re-queued failed invoice %s for user %s", invoice.id, request.user.id)
+
+        return Response({"detail": f"Queued {count} invoice(s) for reprocessing.", "queued": count})
+
+
+class NotificationListView(APIView):
+    """GET /api/notifications/ — last 20 notifications with unread count."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        qs = Notification.objects.filter(user=request.user)[:20]
+        unread_count = Notification.objects.filter(user=request.user, is_read=False).count()
+        return Response({
+            "results": NotificationSerializer(qs, many=True).data,
+            "unread_count": unread_count,
+        })
+
+
+class NotificationMarkReadView(APIView):
+    """POST /api/notifications/mark-read/ — mark all notifications as read."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return Response({"status": "ok"})
+
+
+class UsageView(APIView):
+    """GET /api/invoices/usage/ — current month invoice count vs plan limit."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        count = monthly_invoice_count(request.user)
+        return Response({
+            "invoice_count": count,
+            "invoice_limit": FREE_PLAN_LIMIT,
+            "plan": "free",
+        })
+
+
 class InvoiceUploadView(APIView):
     """
     POST /api/invoices/upload/
@@ -165,6 +308,30 @@ class InvoiceUploadView(APIView):
             return Response(
                 {"detail": f"Maximum {MAX_FILES_PER_REQUEST} files per request."},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        current_count = monthly_invoice_count(request.user)
+        remaining     = FREE_PLAN_LIMIT - current_count
+        if remaining <= 0:
+            return Response(
+                {
+                    "detail": f"You've reached your monthly limit of {FREE_PLAN_LIMIT} invoices. Upgrade to continue.",
+                    "code":           "plan_limit_exceeded",
+                    "invoice_count":  current_count,
+                    "invoice_limit":  FREE_PLAN_LIMIT,
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if len(files) > remaining:
+            return Response(
+                {
+                    "detail": f"You can only upload {remaining} more invoice(s) this month (limit: {FREE_PLAN_LIMIT}).",
+                    "code":           "plan_limit_exceeded",
+                    "invoice_count":  current_count,
+                    "invoice_limit":  FREE_PLAN_LIMIT,
+                    "remaining":      remaining,
+                },
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         for f in files:

@@ -3,6 +3,34 @@ from django.conf import settings
 from django.db import models
 
 
+class Notification(models.Model):
+    class Kind(models.TextChoices):
+        INVOICE_PROCESSED = "INVOICE_PROCESSED", "Invoice Processed"
+        INVOICE_FAILED    = "INVOICE_FAILED",    "Invoice Failed"
+        SYNC_ERROR        = "SYNC_ERROR",        "Sync Error"
+
+    user       = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="notifications",
+    )
+    kind       = models.CharField(max_length=30, choices=Kind.choices)
+    title      = models.CharField(max_length=255)
+    body       = models.TextField(blank=True)
+    invoice    = models.ForeignKey(
+        "Invoice",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    is_read    = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+
 class Invoice(models.Model):
     class Status(models.TextChoices):
         UPLOADED          = "UPLOADED",          "Uploaded"
@@ -60,6 +88,7 @@ class DuplicateCheckResult(models.Model):
     )
     best_match_score = models.FloatField(null=True, blank=True)
     score_details    = models.JSONField(default=dict)
+    dismissed        = models.BooleanField(default=False)
     checked_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:

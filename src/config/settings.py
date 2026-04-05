@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     'channels',
     'users',
     'invoices',
+    'gmail_integration',
 ]
 
 MIDDLEWARE = [
@@ -166,3 +167,47 @@ MINDEE_MODEL_ID = config('MINDEE_MODEL_ID', default='fe31f6d8-7b31-43a6-9e9b-65f
 
 # OpenAI — used for invoice embedding and duplicate detection (optional)
 OPENAI_API_KEY = config('OPENAI_API_KEY', default=None)
+
+# ── Gmail Integration ─────────────────────────────────────────────────────────
+# Register http://localhost:8000/api/gmail/callback/ as an authorised redirect
+# URI in your Google Cloud Console OAuth 2.0 client.
+GOOGLE_CLIENT_ID     = config('GOOGLE_CLIENT_ID',     default='')
+GOOGLE_CLIENT_SECRET = config('GOOGLE_CLIENT_SECRET', default='')
+GMAIL_OAUTH_REDIRECT_URI = config(
+    'GMAIL_OAUTH_REDIRECT_URI',
+    default='http://localhost:8000/api/gmail/callback/',
+)
+FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
+
+# ── Resend — transactional email ──────────────────────────────────────────────
+RESEND_API_KEY    = config('RESEND_API_KEY',    default='')
+RESEND_FROM_EMAIL = config('RESEND_FROM_EMAIL', default='Ledgix <onboarding@resend.dev>')
+
+# Pub/Sub topic that Google should deliver Gmail push notifications to.
+# Format: projects/<project-id>/topics/<topic-name>
+GMAIL_PUBSUB_TOPIC = config('GMAIL_PUBSUB_TOPIC', default='')
+
+# ── Celery Beat — periodic Gmail auto-sync ────────────────────────────────────
+# Requires a separate beat worker:  celery -A config beat --loglevel=info
+from celery.schedules import crontab  # noqa: E402
+
+CELERY_BEAT_SCHEDULE = {
+    # History-based incremental sync is cheap (only fetches new messages), so
+    # running every 2 minutes gives near-real-time invoice detection.
+    'gmail-auto-sync-every-2-min': {
+        'task':     'gmail_integration.tasks.sync_all_active_integrations',
+        'schedule': crontab(minute='*/2'),
+    },
+    # Gmail push watches expire after at most 7 days; renew any that are
+    # within 24 hours of expiry so notifications stay active continuously.
+    'renew-gmail-watches-daily': {
+        'task':     'gmail_integration.tasks.renew_expiring_watches',
+        'schedule': crontab(hour='*/12'),
+    },
+    # Purge unverified accounts that are older than 7 days so the email
+    # can be re-used for a fresh sign-up.
+    'delete-unverified-users-daily': {
+        'task':     'users.tasks.delete_unverified_users',
+        'schedule': crontab(hour=3, minute=0),  # 03:00 UTC daily
+    },
+}

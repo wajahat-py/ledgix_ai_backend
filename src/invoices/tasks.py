@@ -8,7 +8,7 @@ from celery import shared_task
 from channels.layers import get_channel_layer
 from django.conf import settings
 
-from .models import DuplicateCheckResult, Invoice
+from .models import DuplicateCheckResult, Invoice, Notification
 from .serializers import InvoiceSerializer
 
 logger = logging.getLogger(__name__)
@@ -86,6 +86,49 @@ def _push_update(invoice: Invoice) -> None:
             "data": InvoiceSerializer(invoice_with_rels).data,
         },
     )
+
+
+# ── notification helpers ──────────────────────────────────────────────────────
+
+def _push_notification(notif: Notification) -> None:
+    """Push a new notification over the user's WebSocket channel."""
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return
+    group = f"invoices_{notif.user_id}"
+    async_to_sync(channel_layer.group_send)(
+        group,
+        {
+            "type": "notification.new",
+            "data": {
+                "id": notif.id,
+                "kind": notif.kind,
+                "title": notif.title,
+                "body": notif.body,
+                "invoice_id": notif.invoice_id,
+                "is_read": notif.is_read,
+                "created_at": notif.created_at.isoformat(),
+            },
+        },
+    )
+
+
+def _create_notification(
+    user_id: int,
+    kind: str,
+    title: str,
+    body: str = "",
+    invoice: "Invoice | None" = None,
+) -> Notification:
+    notif = Notification.objects.create(
+        user_id=user_id,
+        kind=kind,
+        title=title,
+        body=body,
+        invoice=invoice,
+    )
+    _push_notification(notif)
+    return notif
 
 
 # ── normalization helpers ─────────────────────────────────────────────────────
@@ -263,6 +306,20 @@ def process_invoice(self, invoice_id: int) -> None:
         _push_update(invoice)
         logger.info("Invoice %s processed successfully", invoice_id)
 
+        # Build a human-readable notification title from extracted fields.
+        vendor = _get_field_value(extracted, "supplier_name", "vendor_name", "seller_name", "company_name")
+        amount_raw = _get_field_value(extracted, "total_amount", "amount_due", "grand_total", "subtotal")
+        amount = _normalize_amount(amount_raw)
+        if vendor and amount is not None:
+            notif_title = f"Invoice processed \u2013 ${amount:,.2f} from {vendor}"
+        elif amount is not None:
+            notif_title = f"Invoice processed \u2013 ${amount:,.2f}"
+        elif vendor:
+            notif_title = f"Invoice processed from {vendor}"
+        else:
+            notif_title = f"Invoice processed \u2013 {invoice.original_filename}"
+        _create_notification(invoice.user_id, Notification.Kind.INVOICE_PROCESSED, notif_title, invoice=invoice)
+
         check_invoice_duplicates.delay(invoice_id)
 
     except Exception as exc:
@@ -271,6 +328,14 @@ def process_invoice(self, invoice_id: int) -> None:
         invoice.error_message = str(exc)
         invoice.save(update_fields=["status", "error_message", "updated_at"])
         _push_update(invoice)
+        if self.request.retries >= self.max_retries:
+            _create_notification(
+                invoice.user_id,
+                Notification.Kind.INVOICE_FAILED,
+                f"Failed to extract \u2013 {invoice.original_filename}",
+                body=str(exc)[:200],
+                invoice=invoice,
+            )
         raise self.retry(exc=exc)
 
 
@@ -370,6 +435,41 @@ def check_invoice_duplicates(self, invoice_id: int) -> None:
     best_score = final_scores[best_id]
     best_candidate = next(c for c in candidates if c.pk == best_id)
 
+    # ── LLM verification ───────────────────────────────────────────────────
+    llm_decision = None
+    if 0.40 <= best_score < 0.90 and settings.OPENAI_API_KEY:
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=settings.OPENAI_API_KEY)
+            
+            prompt = (
+                "You are an expert invoice auditor. Compare these two invoices and decide if they are duplicates.\n"
+                "Invoices are considered duplicates if they are for the same transaction (same vendor, same amount, same date, and usually same invoice number).\n\n"
+                f"NEW INVOICE:\n{current_fields}\n\n"
+                f"EXISTING INVOICE MATCH:\n{candidate_fields[best_id]}\n\n"
+                "Respond ONLY with a JSON object: {\"is_duplicate\": true/false, \"confidence\": 0.0-1.0, \"reason\": \"string\"}"
+            )
+            
+            chat_response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+            )
+            import json
+            result = json.loads(chat_response.choices[0].message.content)
+            llm_decision = result
+            
+            # Adjust best_score based on LLM feedback
+            if result.get("is_duplicate"):
+                # If LLM is confident it's a duplicate, boost score
+                best_score = max(best_score, 0.85 * result.get("confidence", 1.0))
+            else:
+                # If LLM says it's not a duplicate, lower score
+                best_score = min(best_score, 1.0 - (0.60 * result.get("confidence", 1.0)))
+                
+        except Exception as exc:
+            logger.warning("LLM verification failed for invoice %s: %s", invoice_id, exc)
+
     if best_score >= 0.85:
         decision = DuplicateCheckResult.Decision.DUPLICATE
     elif best_score >= 0.55:
@@ -391,6 +491,7 @@ def check_invoice_duplicates(self, invoice_id: int) -> None:
                 "fuzzy_score":         fuzzy_scores[best_id],
                 "embedding_score":     embedding_scores.get(best_id),
                 "final_score":         best_score,
+                "llm_verification":    llm_decision,
                 "candidates_checked":  len(candidates),
                 "candidates_embedded": candidates_embedded,
             },
