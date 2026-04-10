@@ -27,7 +27,7 @@ ENV/
 # Static & media files
 
 /staticfiles/
-/media/
+
 
 # Migrations (optional: comment this if you want to track them)
 
@@ -105,4 +105,3 @@ dmypy.json
 *.bak
 *.tmp
 
-*.pdf
