@@ -1,12 +1,14 @@
 from django.conf import settings
 from django.conf.urls.static import static
 from django.contrib import admin
+from django.http import JsonResponse
 from django.urls import include, path
 
 from invoices.views import NotificationListView, NotificationMarkReadView
 from organizations.urls import invitation_urlpatterns
 
 urlpatterns = [
+    path("", lambda request: JsonResponse({"message": "Hello World"})),
     path("admin/", admin.site.urls),
     path("api/auth/", include("users.urls")),
     path("api/invoices/", include("invoices.urls")),
