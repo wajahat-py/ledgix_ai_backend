@@ -6,6 +6,15 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
+def _resend_configured() -> bool:
+    return bool((settings.RESEND_API_KEY or "").strip())
+
+
+def _log_dev_email(action: str, recipient: str, url: str) -> None:
+    logger.warning("RESEND_API_KEY is not configured. %s email to %s was not sent.", action, recipient)
+    logger.info("%s URL for %s: %s", action, recipient, url)
+
+
 def send_contact_sales_email(name: str, email: str, company: str, message: str) -> None:
     """Forward a Contact Sales form submission to the sales inbox."""
     resend.api_key = settings.RESEND_API_KEY
@@ -76,6 +85,10 @@ def send_password_reset_email(user, token) -> None:
     """
     reset_url = f"{settings.FRONTEND_URL}/reset-password?token={token}"
 
+    if not _resend_configured():
+        _log_dev_email("Password reset", user.email, reset_url)
+        return
+
     resend.api_key = settings.RESEND_API_KEY
 
     html = f"""
@@ -130,6 +143,10 @@ def send_verification_email(pending) -> None:
     """
     verify_url = f"{settings.FRONTEND_URL}/verify-email?token={pending.token}"
 
+    if not _resend_configured():
+        _log_dev_email("Verification", pending.email, verify_url)
+        return
+
     resend.api_key = settings.RESEND_API_KEY
 
     html = f"""
@@ -167,8 +184,5 @@ def send_verification_email(pending) -> None:
         "html": html,
     }
 
-    try:
-        resend.Emails.send(params)
-        logger.info("Verification email sent to %s", pending.email)
-    except Exception as exc:
-        logger.error("Failed to send verification email to %s: %s", pending.email, exc)
+    resend.Emails.send(params)
+    logger.info("Verification email sent to %s", pending.email)

@@ -2,6 +2,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from decouple import config, Csv
+from corsheaders.defaults import default_headers
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,7 +29,9 @@ INSTALLED_APPS = [
     'channels',
     'users',
     'invoices',
+    'organizations',
     'gmail_integration',
+    'billing',
 ]
 
 MIDDLEWARE = [
@@ -68,7 +71,7 @@ WSGI_APPLICATION = 'config.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': config('SQLITE_PATH', default=str(BASE_DIR / 'db.sqlite3')),
     }
 }
 
@@ -108,10 +111,11 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = config('STATIC_ROOT', default=str(BASE_DIR / 'staticfiles'))
 
 # Media files (uploaded invoices)
 MEDIA_URL = '/media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+MEDIA_ROOT = config('MEDIA_ROOT', default=str(BASE_DIR / 'media'))
 
 # Custom User Model
 AUTH_USER_MODEL = 'users.User'
@@ -123,6 +127,9 @@ CORS_ALLOWED_ORIGINS = config(
     cast=Csv(),
 )
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    "x-organization-id",
+]
 
 # REST Framework settings
 REST_FRAMEWORK = {
@@ -159,10 +166,11 @@ CELERY_TASK_TRACK_STARTED = True
 # Windows: billiard's prefork pool uses Unix shared memory that Windows denies.
 # The solo pool runs tasks in the worker's main thread — fine for development.
 # On Linux in production, remove this line to use the default prefork pool.
-CELERY_WORKER_POOL = 'solo'
+CELERY_WORKER_POOL = config('CELERY_WORKER_POOL', default='solo')
 
 # Mindee
 MINDEE_API_KEY = config('MINDEE_API_KEY')
+MINDEE_V2_API_KEY = config('MINDEE_V2_API_KEY', default=MINDEE_API_KEY)
 MINDEE_MODEL_ID = config('MINDEE_MODEL_ID', default='fe31f6d8-7b31-43a6-9e9b-65ff6737c4e9')
 
 # OpenAI — used for invoice embedding and duplicate detection (optional)
@@ -171,17 +179,32 @@ OPENAI_API_KEY = config('OPENAI_API_KEY', default=None)
 # ── Gmail Integration ─────────────────────────────────────────────────────────
 # Register http://localhost:8000/api/gmail/callback/ as an authorised redirect
 # URI in your Google Cloud Console OAuth 2.0 client.
-GOOGLE_CLIENT_ID     = config('GOOGLE_CLIENT_ID',     default='')
-GOOGLE_CLIENT_SECRET = config('GOOGLE_CLIENT_SECRET', default='')
+# OAuth credentials for Google Sign-In (NextAuth / id_token verification)
+GOOGLE_CLIENT_ID_AUTH     = config('GOOGLE_CLIENT_ID_AUTH',     default='')
+GOOGLE_CLIENT_SECRET_AUTH = config('GOOGLE_CLIENT_SECRET_AUTH', default='')
+
+# OAuth credentials for Gmail inbox integration
+GOOGLE_CLIENT_ID_EMAIL     = config('GOOGLE_CLIENT_ID_EMAIL',     default='')
+GOOGLE_CLIENT_SECRET_EMAIL = config('GOOGLE_CLIENT_SECRET_EMAIL', default='')
 GMAIL_OAUTH_REDIRECT_URI = config(
     'GMAIL_OAUTH_REDIRECT_URI',
     default='http://localhost:8000/api/gmail/callback/',
 )
+BACKEND_URL = config('BACKEND_URL', default='http://localhost:8000')
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
 
 # ── Resend — transactional email ──────────────────────────────────────────────
 RESEND_API_KEY    = config('RESEND_API_KEY',    default='')
 RESEND_FROM_EMAIL = config('RESEND_FROM_EMAIL', default='Ledgix <onboarding@resend.dev>')
+
+# ── Stripe ────────────────────────────────────────────────────────────────────
+STRIPE_PUBLISHABLE_KEY  = config('DEV_STRIPE_PUBLISHABLE_KEY',  default='')
+STRIPE_SECRET_KEY       = config('DEV_STRIPE_SECRET_KEY',       default='')
+# NOTE: This should be a price_ ID (e.g. price_xxx), not a product ID.
+# Find it in your Stripe Dashboard → Products → [your product] → Pricing.
+STRIPE_PRO_PRICE_ID     = config('DEV_STRIPE_PRO_PRICE_ID',     default='')
+# Set via `stripe listen --forward-to localhost:8000/api/billing/webhook/`
+STRIPE_WEBHOOK_SECRET   = config('STRIPE_WEBHOOK_SECRET',       default='')
 
 # Pub/Sub topic that Google should deliver Gmail push notifications to.
 # Format: projects/<project-id>/topics/<topic-name>
@@ -190,6 +213,39 @@ GMAIL_PUBSUB_TOPIC = config('GMAIL_PUBSUB_TOPIC', default='')
 # ── Celery Beat — periodic Gmail auto-sync ────────────────────────────────────
 # Requires a separate beat worker:  celery -A config beat --loglevel=info
 from celery.schedules import crontab  # noqa: E402
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "[{levelname}] {name}: {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+    },
+    "root": {
+        "handlers": ["console"],
+        "level": "WARNING",
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "gmail_integration": {
+            "handlers": ["console"],
+            "level": "DEBUG",
+            "propagate": False,
+        },
+    },
+}
 
 CELERY_BEAT_SCHEDULE = {
     # History-based incremental sync is cheap (only fetches new messages), so

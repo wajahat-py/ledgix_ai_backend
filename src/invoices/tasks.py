@@ -22,48 +22,71 @@ _PROCESSED_STATUSES = frozenset({
 
 # ── serialization helper ──────────────────────────────────────────────────────
 
-def _serialize_field(field):
-    """Recursively convert a Mindee v2 field object to a JSON-safe value."""
-    if field is None:
+def _serialize_raw_field(raw_field):
+    """
+    Recursively serialize a raw Mindee V2 field dict (from the API JSON) to a
+    JSON-safe structure.
+
+    Mindee returns three field shapes:
+      - Simple:  {"value": <scalar|null>, "raw_value": <str|null>, "confidence": ..., "locations": ...}
+      - List:    {"items": [...], "confidence": ...}
+      - Object:  {"fields": {...}, "confidence": ...}
+
+    When `value` is null but `raw_value` is not, we use raw_value so the
+    extracted text is never silently dropped.
+    """
+    if raw_field is None:
         return None
-    if hasattr(field, "items") and not isinstance(field, str):
-        try:
-            serialized = [_serialize_field(item) for item in field.items]
-            result = {"items": serialized}
-            if hasattr(field, "confidence") and field.confidence is not None:
-                conf = field.confidence
-                result["confidence"] = conf.value if hasattr(conf, "value") else str(conf)
-            return result
-        except (TypeError, AttributeError):
-            pass
-    if hasattr(field, "__iter__") and not isinstance(field, str):
-        try:
-            return [_serialize_field(item) for item in field]
-        except TypeError:
-            pass
-    if hasattr(field, "fields"):
-        data = {}
-        for k, v in field.fields.items():
-            serialized_v = _serialize_field(v)
-            if serialized_v == "[object Object]":
+    if not isinstance(raw_field, dict):
+        # Scalar that somehow escaped wrapping — return as-is.
+        return raw_field
+
+    # ── List field ────────────────────────────────────────────────────────────
+    if "items" in raw_field:
+        items = [_serialize_raw_field(item) for item in raw_field["items"]]
+        result: dict = {"items": items}
+        if raw_field.get("confidence") is not None:
+            result["confidence"] = raw_field["confidence"]
+        return result
+
+    # ── Object field (nested sub-fields) ─────────────────────────────────────
+    if "fields" in raw_field:
+        data: dict = {}
+        for k, v in raw_field["fields"].items():
+            serialized = _serialize_raw_field(v)
+            if serialized == "[object Object]":
                 continue
-            if isinstance(serialized_v, dict) and serialized_v.get("value") == "[object Object]":
-                serialized_v = {kk: vv for kk, vv in serialized_v.items() if kk != "value"}
-            data[k] = serialized_v
+            if isinstance(serialized, dict) and serialized.get("value") == "[object Object]":
+                serialized = {kk: vv for kk, vv in serialized.items() if kk != "value"}
+            data[k] = serialized
+        if raw_field.get("confidence") is not None:
+            data["confidence"] = raw_field["confidence"]
         return data
-    result = {}
-    if hasattr(field, "value"):
-        value = field.value
+
+    # ── Simple field ──────────────────────────────────────────────────────────
+    if "value" in raw_field:
+        value = raw_field.get("value")
+        raw_value = raw_field.get("raw_value")
+
         if value == "[object Object]":
             value = None
         elif isinstance(value, date):
             value = value.isoformat()
-        if value is not None:
-            result["value"] = value
-    if hasattr(field, "confidence") and field.confidence is not None:
-        conf = field.confidence
-        result["confidence"] = conf.value if hasattr(conf, "value") else str(conf)
-    return result if result else str(field)
+
+        # raw_value is the verbatim text the model read from the document.
+        # Fall back to it when the typed value is null so we never discard
+        # text that was clearly present on the invoice.
+        display_value = value if value is not None else raw_value
+
+        result = {}
+        if display_value is not None and display_value != "[object Object]":
+            result["value"] = display_value
+        if raw_field.get("confidence") is not None:
+            result["confidence"] = raw_field["confidence"]
+        return result
+
+    # Unknown shape — store as string to avoid silent data loss.
+    return str(raw_field)
 
 
 # ── WebSocket push ────────────────────────────────────────────────────────────
@@ -289,14 +312,17 @@ def process_invoice(self, invoice_id: int) -> None:
     try:
         from mindee import ClientV2, InferenceParameters, InferenceResponse, PathInput
 
-        client = ClientV2(settings.MINDEE_API_KEY)
+        client = ClientV2(settings.MINDEE_V2_API_KEY)
         params = InferenceParameters(model_id=settings.MINDEE_MODEL_ID, confidence=True)
         input_source = PathInput(invoice.file.path)
         response = client.enqueue_and_get_result(InferenceResponse, input_source, params)
 
+        # Use the raw API JSON directly so raw_value (the verbatim text the
+        # model read) is available as a fallback when the typed value is null.
+        raw_fields = response._raw_http.get("inference", {}).get("result", {}).get("fields", {})
         extracted = {
-            key: _serialize_field(field)
-            for key, field in response.inference.result.fields.items()
+            key: _serialize_raw_field(raw_field)
+            for key, raw_field in raw_fields.items()
         }
 
         invoice.status = Invoice.Status.PROCESSED

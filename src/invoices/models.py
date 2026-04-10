@@ -41,11 +41,20 @@ class Invoice(models.Model):
         APPROVED          = "APPROVED",          "Approved"
         REJECTED          = "REJECTED",          "Rejected"
 
-    user              = models.ForeignKey(
+    # The user who uploaded this invoice
+    user         = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         related_name="invoices",
     )
+    # Org-scoping — all queries filter by organization
+    organization = models.ForeignKey(
+        "organizations.Organization",
+        on_delete=models.CASCADE,
+        related_name="invoices",
+        null=True,   # nullable for the migration; set on every new invoice
+    )
+
     file              = models.FileField(upload_to="invoices/%Y/%m/")
     original_filename = models.CharField(max_length=255)
     status            = models.CharField(
@@ -57,8 +66,25 @@ class Invoice(models.Model):
     extracted_data    = models.JSONField(null=True, blank=True)
     embedding         = models.JSONField(null=True, blank=True)
     error_message     = models.TextField(blank=True)
-    created_at        = models.DateTimeField(auto_now_add=True)
-    updated_at        = models.DateTimeField(auto_now=True)
+
+    # Approval / rejection audit trail
+    approved_by      = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    rejected_by      = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    reviewed_at      = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]

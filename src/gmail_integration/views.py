@@ -7,7 +7,8 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from invoices.utils import FREE_PLAN_LIMIT, monthly_invoice_count
+from invoices.utils import invoice_limit_for_org, monthly_invoice_count
+from organizations.mixins import get_or_create_personal_org
 from .models import GmailIntegration, GmailSyncedMessage
 from .serializers import GmailStatusSerializer, GmailSyncedMessageSerializer
 from .service import exchange_code_and_save, get_oauth_url, get_gmail_service, revoke_token
@@ -59,7 +60,10 @@ class GmailCallbackView(APIView):
             logger.warning("Gmail callback state error: %s", exc)
             return redirect(f"{frontend_url}/email?gmail=error&reason=invalid_state")
         except Exception as exc:
-            logger.exception("Gmail callback unexpected error: %s", exc)
+            logger.exception(
+                "Gmail callback unexpected error (%s): %s",
+                type(exc).__name__, exc,
+            )
             return redirect(f"{frontend_url}/email?gmail=error&reason=server_error")
 
         # Kick off the initial inbox scan and register the push watch
@@ -108,10 +112,13 @@ class GmailSyncView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if monthly_invoice_count(request.user) >= FREE_PLAN_LIMIT:
+        org, _ = get_or_create_personal_org(request.user)
+        limit = invoice_limit_for_org(org)
+        count = monthly_invoice_count(org)
+        if limit is not None and count >= limit:
             return Response(
                 {
-                    "detail": f"You've reached your monthly limit of {FREE_PLAN_LIMIT} invoices. Upgrade to sync more.",
+                    "detail": f"You've reached your monthly limit of {limit} invoices. Upgrade to sync more.",
                     "code": "plan_limit_exceeded",
                 },
                 status=status.HTTP_403_FORBIDDEN,
@@ -265,10 +272,13 @@ class GmailRetryView(APIView):
         if synced.invoice_id:
             return Response({"detail": "Invoice already linked."}, status=status.HTTP_400_BAD_REQUEST)
 
-        if monthly_invoice_count(request.user) >= FREE_PLAN_LIMIT:
+        org, _ = get_or_create_personal_org(request.user)
+        limit = invoice_limit_for_org(org)
+        count = monthly_invoice_count(org)
+        if limit is not None and count >= limit:
             return Response(
                 {
-                    "detail": f"You've reached your monthly limit of {FREE_PLAN_LIMIT} invoices. Upgrade to import more.",
+                    "detail": f"You've reached your monthly limit of {limit} invoices. Upgrade to import more.",
                     "code": "plan_limit_exceeded",
                 },
                 status=status.HTTP_403_FORBIDDEN,
@@ -284,6 +294,7 @@ class GmailRetryView(APIView):
         try:
             invoice = Invoice.objects.create(
                 user=request.user,
+                organization=org,
                 file=ContentFile(data, name=synced.attachment_filename),
                 original_filename=synced.attachment_filename,
                 status=Invoice.Status.UPLOADED,
@@ -413,17 +424,20 @@ class GmailPubSubView(APIView):
         if not email_address:
             return Response(status=status.HTTP_204_NO_CONTENT)
 
-        try:
-            integration = GmailIntegration.objects.get(
-                gmail_address=email_address, is_active=True
-            )
-        except GmailIntegration.DoesNotExist:
+        # Multiple users might connect the same shared Gmail mailbox.
+        # Find all active integrations for this address and sync each one.
+        integrations = GmailIntegration.objects.filter(
+            gmail_address=email_address, is_active=True
+        )
+
+        if not integrations.exists():
             logger.warning(
                 "GmailPubSubView: no active integration for %s", email_address
             )
             return Response(status=status.HTTP_204_NO_CONTENT)
 
         from .tasks import sync_gmail_invoices
-        sync_gmail_invoices.delay(integration.user_id)
+        for integration in integrations:
+            sync_gmail_invoices.delay(integration.user_id)
 
         return Response(status=status.HTTP_204_NO_CONTENT)

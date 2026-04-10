@@ -19,6 +19,8 @@ def sync_gmail_invoices(self, user_id: int) -> dict:
 
     from invoices.models import Invoice
     from invoices.tasks import process_invoice as enqueue_processing
+    from invoices.utils import invoice_limit_for_org, monthly_invoice_count
+    from organizations.mixins import get_or_create_personal_org
 
     from .models import GmailIntegration, GmailSyncedMessage
     from .service import (
@@ -39,6 +41,9 @@ def sync_gmail_invoices(self, user_id: int) -> dict:
     except GmailIntegration.DoesNotExist:
         logger.warning("sync_gmail_invoices: no active integration for user %s", user_id)
         return {"error": "No active Gmail integration"}
+
+    org, _ = get_or_create_personal_org(integration.user)
+    invoice_limit = invoice_limit_for_org(org)
 
     try:
         service = get_gmail_service(integration)
@@ -132,11 +137,27 @@ def sync_gmail_invoices(self, user_id: int) -> dict:
                 results["errors"].append(f"download:{attachment_id}: {exc}")
                 continue
 
+            # Check plan limit *before* creating the invoice.
+            # If at limit, we delete the synced_msg record and BREAK.
+            # This "pauses" the sync for this user until they upgrade or the 
+            # next month starts, without updating the history_id.
+            if invoice_limit is not None and monthly_invoice_count(org) >= invoice_limit:
+                results["errors"].append("plan_limit_exceeded")
+                logger.info(
+                    "Gmail sync user %s: plan limit %s reached. Pausing sync.",
+                    user_id, invoice_limit
+                )
+                synced_msg.delete()
+                # Stop processing this user for now. We skip the history_id 
+                # update at the end by returning early.
+                return results
+
             # Create the Invoice record, then mark as detected only on success.
             try:
                 from invoices.tasks import _push_update
                 invoice = Invoice.objects.create(
                     user_id=user_id,
+                    organization=org,
                     file=ContentFile(data, name=filename),
                     original_filename=filename,
                     status=Invoice.Status.UPLOADED,

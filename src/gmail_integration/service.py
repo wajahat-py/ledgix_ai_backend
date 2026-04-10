@@ -49,18 +49,34 @@ MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MB
 
 _FILENAME_KW = frozenset({
     "invoice", "receipt", "bill", "statement", "inv", "rcpt",
-    "billing", "payment", "order", "purchase",
+    "billing", "payment", "order", "purchase", "tax", "fee", "subscription",
 })
 
 _SUBJECT_KW = frozenset({
     "invoice", "receipt", "bill", "statement", "payment",
-    "billing", "order", "purchase", "transaction",
+    "billing", "order", "purchase", "transaction", "tax", "fee",
 })
 
 _SENDER_KW = frozenset({
     "billing", "invoice", "invoices", "receipts", "payment",
     "accounting", "finance", "accounts", "noreply", "no-reply",
+    "stripe", "paypal", "square", "support",
 })
+
+
+def _kw_match(text: str, keywords: frozenset[str]) -> bool:
+    """Return True if any keyword matches the text as a word or prefix."""
+    import re
+    t = text.lower()
+    for kw in keywords:
+        # Avoid short keyword "inv" matching "invitation"
+        if kw == "inv":
+            if re.search(r"\binv[o\d\W]", t):  # matches "inv-", "inv1", "invoice"
+                return True
+            continue
+        if kw in t:
+            return True
+    return False
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -68,8 +84,8 @@ _SENDER_KW = frozenset({
 def _client_config() -> dict:
     return {
         "web": {
-            "client_id": settings.GOOGLE_CLIENT_ID,
-            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "client_id": settings.GOOGLE_CLIENT_ID_EMAIL,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET_EMAIL,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "redirect_uris": [settings.GMAIL_OAUTH_REDIRECT_URI],
@@ -92,8 +108,8 @@ def _build_credentials(integration):
         token=integration.access_token,
         refresh_token=integration.refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
-        client_id=settings.GOOGLE_CLIENT_ID,
-        client_secret=settings.GOOGLE_CLIENT_SECRET,
+        client_id=settings.GOOGLE_CLIENT_ID_EMAIL,
+        client_secret=settings.GOOGLE_CLIENT_SECRET_EMAIL,
         scopes=SCOPES,
     )
 
@@ -123,7 +139,7 @@ def get_oauth_url(user) -> str:
     )
 
     params = {
-        "client_id":              settings.GOOGLE_CLIENT_ID,
+        "client_id":              settings.GOOGLE_CLIENT_ID_EMAIL,
         "redirect_uri":           settings.GMAIL_OAUTH_REDIRECT_URI,
         "response_type":          "code",
         "scope":                  " ".join(SCOPES),
@@ -150,7 +166,7 @@ def exchange_code_and_save(code: str, state: str):
     except signing.BadSignature:
         raise ValueError("Invalid or expired OAuth state.")
 
-    user_id      = data["user_id"]
+    user_id       = data["user_id"]
     code_verifier = data.get("cv")   # PKCE verifier stored during get_oauth_url()
 
     # google_auth_oauthlib rejects http:// redirect URIs unless this env var is
@@ -160,15 +176,35 @@ def exchange_code_and_save(code: str, state: str):
     if settings.DEBUG:
         os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 
-    flow = _make_flow()
-    # Pass the PKCE verifier so Google can verify it against the challenge it
-    # received in the authorization request.
-    flow.fetch_token(code=code, code_verifier=code_verifier)
-    creds = flow.credentials
+    logger.debug("exchange_code_and_save: user_id=%s, starting token exchange", user_id)
 
-    oauth2_service = build("oauth2", "v2", credentials=creds)
-    user_info = oauth2_service.userinfo().get().execute()
-    gmail_address = user_info["email"]
+    try:
+        flow = _make_flow()
+        # Pass the PKCE verifier so Google can verify it against the challenge it
+        # received in the authorization request.
+        flow.fetch_token(code=code, code_verifier=code_verifier)
+        creds = flow.credentials
+    except Exception as exc:
+        logger.error(
+            "exchange_code_and_save: token exchange failed for user %s — %s: %s",
+            user_id, type(exc).__name__, exc,
+        )
+        raise
+
+    logger.debug("exchange_code_and_save: token exchange OK, fetching userinfo")
+
+    try:
+        oauth2_service = build("oauth2", "v2", credentials=creds)
+        user_info = oauth2_service.userinfo().get().execute()
+        gmail_address = user_info["email"]
+    except Exception as exc:
+        logger.error(
+            "exchange_code_and_save: userinfo fetch failed for user %s — %s: %s",
+            user_id, type(exc).__name__, exc,
+        )
+        raise
+
+    logger.debug("exchange_code_and_save: got gmail_address=%s", gmail_address)
 
     expiry = None
     if creds.expiry:
@@ -294,12 +330,13 @@ def is_likely_invoice(filename: str, mime_type: str, subject: str, sender: str) 
     Heuristic scorer — True when the attachment is probably an invoice.
 
     Scoring:
-      +1  PDF attachment (stronger file-type signal than a plain image)
+      +2  PDF attachment (stronger file-type signal)
+      +1  Image attachment
       +3  filename contains an invoice keyword
       +2  email subject contains an invoice keyword
       +1  sender address contains a billing-style keyword
 
-    Threshold: score >= 2
+    Threshold: score >= 3
     """
     if mime_type not in ALLOWED_MIME_TYPES:
         if os.path.splitext(filename)[1].lower() not in ALLOWED_EXTENSIONS:
@@ -311,18 +348,20 @@ def is_likely_invoice(filename: str, mime_type: str, subject: str, sender: str) 
     snd = sender.lower()
 
     if mime_type == "application/pdf":
+        score += 2
+    elif mime_type.startswith("image/"):
         score += 1
 
-    if any(kw in fn for kw in _FILENAME_KW):
+    if _kw_match(fn, _FILENAME_KW):
         score += 3
 
-    if any(kw in sub for kw in _SUBJECT_KW):
+    if _kw_match(sub, _SUBJECT_KW):
         score += 2
 
-    if any(kw in snd for kw in _SENDER_KW):
+    if _kw_match(snd, _SENDER_KW):
         score += 1
 
-    return score >= 2
+    return score >= 3
 
 
 def get_profile(service) -> dict:

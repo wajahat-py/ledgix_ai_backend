@@ -10,6 +10,7 @@ class RegisterSerializer(serializers.Serializer):
     company_name = serializers.CharField(required=False, allow_blank=True, default="")
     password     = serializers.CharField(write_only=True, required=True, min_length=8, style={"input_type": "password"})
     password2    = serializers.CharField(write_only=True, required=True, style={"input_type": "password"})
+    plan         = serializers.CharField(required=False, default="free")
 
     def validate_email(self, value):
         return value.lower().strip()

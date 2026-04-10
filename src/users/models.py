@@ -75,6 +75,7 @@ class PendingRegistration(models.Model):
     last_name    = models.CharField(max_length=150, blank=True)
     company_name = models.CharField(max_length=255, blank=True)
     password     = models.CharField(max_length=128)  # already hashed
+    plan         = models.CharField(max_length=20, default="free")
     token        = models.UUIDField(default=uuid.uuid4, unique=True)
     created_at   = models.DateTimeField(auto_now_add=True)
     last_sent_at = models.DateTimeField(auto_now_add=True)

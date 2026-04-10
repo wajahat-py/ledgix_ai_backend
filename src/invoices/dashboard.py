@@ -35,6 +35,13 @@ _MISSING_DATA_FLAGS = [
 _AMOUNT_KEYS = ("total_amount", "total_net", "amount_due", "grand_total", "subtotal")
 
 
+def _field_value(entry):
+    """Unwrap Mindee-style field objects to their raw value."""
+    if isinstance(entry, dict):
+        return entry.get("value")
+    return entry
+
+
 def _parse_range(range_str: str) -> int:
     """Return number of days for a range string like '7d', '30d', '90d'."""
     mapping = {"7d": 7, "30d": 30, "90d": 90}
@@ -56,7 +63,7 @@ def _safe_amount(invoice: Invoice) -> float:
         if not entry:
             continue
         # Unwrap Mindee's {"value": ..., "confidence": ...} envelope.
-        raw = entry.get("value") if isinstance(entry, dict) else entry
+        raw = _field_value(entry)
         if raw is None:
             continue
         # Strip currency symbols, spaces, commas — keep digits and dot.
@@ -79,10 +86,11 @@ def _is_missing_data(invoice: Invoice) -> bool:
 
 
 def _invoice_stub(invoice: Invoice) -> dict:
+    vendor = _field_value((invoice.extracted_data or {}).get("vendor_name")) or "—"
     return {
         "id":                invoice.id,
         "original_filename": invoice.original_filename,
-        "vendor":            (invoice.extracted_data or {}).get("vendor_name") or "—",
+        "vendor":            vendor,
         "amount":            _safe_amount(invoice),
         "status":            invoice.status,
         "created_at":        invoice.created_at.isoformat(),
@@ -93,13 +101,13 @@ def _invoice_stub(invoice: Invoice) -> dict:
 # Core computation
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_dashboard(user, range_str: str = "30d") -> dict:
+def compute_dashboard(organization, range_str: str = "30d") -> dict:
     days = _parse_range(range_str)
     now  = timezone.now()
     period_start = now - timedelta(days=days)
     prev_start   = period_start - timedelta(days=days)
 
-    user_qs = Invoice.objects.filter(user=user)
+    user_qs = Invoice.objects.filter(organization=organization)
 
     # ── Current-period invoices ──────────────────────────────────────────────
     current_qs = user_qs.filter(created_at__gte=period_start)
@@ -140,7 +148,7 @@ def compute_dashboard(user, range_str: str = "30d") -> dict:
 
     # Duplicates flagged (all time, not dismissed)
     duplicates_flagged = DuplicateCheckResult.objects.filter(
-        invoice__user=user,
+        invoice__organization=organization,
         decision__in=[DuplicateCheckResult.Decision.DUPLICATE, DuplicateCheckResult.Decision.POSSIBLE_DUPLICATE],
         dismissed=False,
     ).count()
@@ -318,9 +326,10 @@ def _build_insights(
     # 2 — Top vendor
     vendor_totals: dict[str, float] = {}
     for inv in current_list:
-        vendor = (inv.extracted_data or {}).get("vendor_name")
+        vendor = _field_value((inv.extracted_data or {}).get("vendor_name"))
         if vendor:
-            vendor_totals[vendor] = vendor_totals.get(vendor, 0) + _safe_amount(inv)
+            vendor_key = str(vendor)
+            vendor_totals[vendor_key] = vendor_totals.get(vendor_key, 0) + _safe_amount(inv)
     if vendor_totals:
         top_vendor = max(vendor_totals, key=lambda v: vendor_totals[v])
         top_amount = vendor_totals[top_vendor]
