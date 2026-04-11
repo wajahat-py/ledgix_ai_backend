@@ -32,25 +32,34 @@ DEMO_PASSWORD = "demo123"
 DEMO_WORKSPACE_NAME = "Ledgix Demo Workspace"
 
 
-def _demo_invoice_bytes() -> bytes:
-    """Return bytes for a valid demo PDF, falling back to a tiny inline PDF."""
-    candidates = [
-        Path(__file__).resolve().parent.parent / "media" / "invoices" / "2026" / "04" / "sample_invoice.pdf",
-        Path(__file__).resolve().parent.parent / "media" / "sample_invoice.pdf",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path.read_bytes()
+_DEMO_PDFS_DIR = Path(__file__).resolve().parent.parent / "invoices" / "demo_pdfs"
 
-    return (
-        b"%PDF-1.4\n"
-        b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-        b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"
-        b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 144]/Contents 4 0 R>>endobj\n"
-        b"4 0 obj<</Length 55>>stream\nBT /F1 18 Tf 36 72 Td (Ledgix Demo Invoice) Tj ET\nendstream endobj\n"
-        b"xref\n0 5\n0000000000 65535 f \n0000000010 00000 n \n0000000053 00000 n \n0000000108 00000 n \n0000000195 00000 n \n"
-        b"trailer<</Root 1 0 R/Size 5>>\nstartxref\n300\n%%EOF\n"
-    )
+_FALLBACK_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 144]/Contents 4 0 R>>endobj\n"
+    b"4 0 obj<</Length 55>>stream\nBT /F1 18 Tf 36 72 Td (Ledgix Demo Invoice) Tj ET\nendstream endobj\n"
+    b"xref\n0 5\n0000000000 65535 f \n0000000010 00000 n \n0000000053 00000 n \n0000000108 00000 n \n0000000195 00000 n \n"
+    b"trailer<</Root 1 0 R/Size 5>>\nstartxref\n300\n%%EOF\n"
+)
+
+
+def _demo_invoice_bytes(filename: str) -> bytes:
+    """Return bytes for a named demo PDF from the static demo_pdfs directory.
+
+    Resolution order:
+      1. invoices/demo_pdfs/<filename>   — exact match
+      2. invoices/demo_pdfs/sample_invoice.pdf — generic fallback
+      3. Minimal valid inline PDF        — last resort (no files at all)
+    """
+    for candidate in (
+        _DEMO_PDFS_DIR / filename,
+        _DEMO_PDFS_DIR / "sample_invoice.pdf",
+    ):
+        if candidate.exists():
+            return candidate.read_bytes()
+    return _FALLBACK_PDF
 
 
 def _attach_demo_pdf(invoice, filename: str, pdf_bytes: bytes) -> None:
@@ -87,7 +96,6 @@ def _seed_demo_workspace(user) -> None:
     """Create a reusable demo workspace with a few realistic sample invoices."""
     from organizations.models import Membership, Organization, _unique_slug
     from invoices.models import DuplicateCheckResult, Invoice
-    pdf_bytes = _demo_invoice_bytes()
 
     membership = (
         Membership.objects
@@ -117,7 +125,7 @@ def _seed_demo_workspace(user) -> None:
 
     if org.invoices.exists():
         for invoice in org.invoices.all():
-            _attach_demo_pdf(invoice, invoice.original_filename, pdf_bytes)
+            _attach_demo_pdf(invoice, invoice.original_filename, _demo_invoice_bytes(invoice.original_filename))
             if invoice.file:
                 invoice.save(update_fields=["file"])
         return
@@ -192,7 +200,7 @@ def _seed_demo_workspace(user) -> None:
             invoice.reviewed_at = spec["reviewed_at"]
             invoice.error_message = spec.get("error_message", "")
 
-        _attach_demo_pdf(invoice, spec["filename"], pdf_bytes)
+        _attach_demo_pdf(invoice, spec["filename"], _demo_invoice_bytes(spec["filename"]))
         invoice.save()
         Invoice.objects.filter(pk=invoice.pk).update(
             created_at=spec["created_at"],

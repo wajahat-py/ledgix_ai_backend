@@ -27,6 +27,7 @@ ENV/
 # Static & media files
 
 /staticfiles/
+/src/media/
 
 
 # Migrations (optional: comment this if you want to track them)
